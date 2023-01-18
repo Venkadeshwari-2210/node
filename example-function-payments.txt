@@ -1,0 +1,396 @@
+const functions = require("firebase-functions");
+const { stripe, db } = require("./../admin");
+const { firestore } = require('firebase-admin');
+const { envConfig } = require("../core/envConfig");
+const CryptoJS = require("crypto-js");
+const { updateOrderWithPayement } = require("../firestore/updateOrderWithPayment");
+const { createUserWithEmailAndPassword } = require("../firestore/createUserWithEmailAndPassword");
+const { addOrderToUser } = require("../firestore/addOrderToUser");
+const { sendEmailNotCallable } = require("../firestore/sendEmailNotCallable");
+const { getUserByUid } = require("../firestore/functions/getUserByUid");
+const { updateWholesalerDeniedProducts } = require("../firestore/functions/updateWholesalerDeniedProducts");
+const { updateOrder } = require("../firestore/updateOrder");
+const { updateOrderNoRegister } = require("../firestore/updateOrderNoRegister");
+const { createInvoiceNotCallable } = require("../zoho/invoices/createInvoiceNew");
+const { isTestDb } = require('../core/helper');
+const { getOrCreateCustomer } = require("./customers");
+const { validateAddressInfoInternal }= require("../dhl/validateAddressInfo");
+
+const getOrders = async (id) => {
+  try {
+    const orders = await db
+      .collection("DBOrders")
+      .where("paymentDetails.id", "==", id)
+      .get();
+    return orders;
+  }catch(e){
+    console.log(e);
+    return false;
+  }
+}
+
+const getOrdersByID = async (id) => {
+  try {
+    const orders = await db
+      .collection("DBOrders")
+      .doc(id)
+      .get();
+    return orders;
+  }catch(e){
+    console.log(e);
+    return false;
+  }
+}
+
+/**
+ * Business logic for specific webhook event types
+ */
+const webhookHandlers = {
+
+  // PAYMENT INTENT
+  "payment_intent.created": async (event) => {
+    const data = event.data.object;
+    console.log("-------------------> start webhook payment-intent-created", {data});
+  },
+
+  "payment_intent.canceled": async (data) => {
+    console.log("-------------------> payment-intent-canceled");
+  },
+
+  "payment_intent.succeeded": async (event) => {
+    const data = event.data.object;
+    console.log("🙌 ----------------- PaymentIntent SUCCEEDED -----------------",{ data });
+
+    let stripeCustomer;
+
+    try {
+      getOrdersByID(data.metadata.order_id)
+        .then(async (doc) => {
+          if (!doc.exists) {
+            return console.log("ORDER not found.");
+          } else if (doc.exists){
+            console.log('document exists', doc.exists);
+          }
+          let order = doc.data();
+
+          order.paymentDetails.status = data.status === 'succeeded' ? 'paid' : data.status;
+          order.paymentDetails.method = data.charges.data[0].payment_method_details.type;
+          order.paymentDetails.lastUpdated = new Date(event.created*1000).toISOString();
+
+          try {
+            const address = await validateAddressInfoInternal(order.addressInfo);
+            console.log({address});
+            const isValidAddress = address.Notification.length <= 1 && Boolean(address.Addresses);
+            console.log('🏠', {address, isValidAddress});  
+            order.isValidAddress = isValidAddress;
+          }
+          catch(e){
+            console.log('validate address error: ', e);
+          }
+
+          if (data.status === "succeeded") {
+
+            console.log('status -> succeeded');
+
+            let uid;
+            const language = order.locale.substring(0, 2) === "nl" ? "nl" : "en";
+            const viewOrderPage = order.type === "wholesale"  ? `${order.type}/invoices` : "platform/orders";
+
+            if (order.registerDetails) {
+
+              console.log("//////ORDER_REGISTER//////");
+
+              const encodedPassword = order.registerDetails.password;
+              const decodedbytes = CryptoJS.AES.decrypt(
+                encodedPassword,
+                envConfig.PASSWORD_SECRET
+              );
+              const decodedPassword = decodedbytes.toString(CryptoJS.enc.Utf8);
+              const registerData = {
+                ...order.registerDetails,
+                password: decodedPassword,
+              };
+
+              console.log("💁", { registerData });
+
+              await createUserWithEmailAndPassword(
+                registerData,
+                async (successData) => {
+                  uid = successData.uid;
+                  await addOrderToUser(order.orderNo, uid);
+                  console.log("-----addOrderToUser-AFTER-----");
+
+                  order.uid = uid;
+                  stripeCustomer = await getOrCreateCustomer(order);
+                  console.info('create stripe user on submit payment', stripeCustomer);
+
+                  await sendEmailNotCallable({
+                    orderNo: order.orderNo,
+                    email: order.contactInfo.mail,
+                    language,
+                    lastUpdated: order.paymentDetails.lastUpdated,
+                    ifFirstPayment: Boolean(order.registerDetails),
+                    uid,
+                    type: "successPayment",
+                    viewOrderPage,
+                  });
+                  console.log("-----sendEmailNotCallable-AFTER-----");
+                  console.log("//////CREATE_USER_WITH_EMAIL_END//////");
+                },
+                (err) => {
+                  console.log("Error user creating", { err });
+                  return console.log("Error user creating", err);
+                }
+              );
+
+              console.log("-----createUserWithEmailAndPassword-AFTER-----");
+
+            } else {
+
+              const ordersArrayName =
+                order.type === "wholesale" ? "wholesaleOrdersIds" : "ordersIds";
+              
+                console.log({ ordersArrayName });
+              
+                if (order.type === "wholesale") {
+                await getUserByUid(order.uid).then(async (user) => {
+                  console.log("saleDenied", user.businessInfo.saleDenied);
+                  const oneTimeOrderProducts = Object.keys(user.businessInfo.saleDenied)
+                    .filter((productId) => !user.businessInfo.saleDenied[productId]);
+                    console.log({ oneTimeOrderProducts });
+                  
+                    const orderedProductsIds = order.shoppingBag.map(
+                    (bagItem) => bagItem.id
+                  );
+                  console.log({ orderedProductsIds });
+                  const deniedProductsIds = orderedProductsIds.filter(
+                    (orderedProductId) =>
+                      oneTimeOrderProducts.includes(orderedProductId)
+                  );
+                  console.log({ deniedProductsIds });
+                  if (deniedProductsIds.length > 0) {
+                    const deniedProductIdsObject = deniedProductsIds.reduce(
+                      (acc, productId) => {
+                        return { ...acc, [productId]: true };
+                      },
+                      {}
+                    );
+                    await updateWholesalerDeniedProducts(order.uid, {
+                      ...user.businessInfo,
+                      saleDenied: deniedProductIdsObject,
+                    });
+                    console.log(
+                      "-----updateWholesalerDeniedProducts-AFTER-----"
+                    );
+                  }
+                  
+                });
+                console.log("-----getUserByUid-AFTER-----");
+              }
+              await addOrderToUser(order.orderNo, order.uid, ordersArrayName);
+              console.log("-----addOrderToUser-AFTER-----");
+              await sendEmailNotCallable({
+                orderNo: order.orderNo,
+                email: order.contactInfo.mail,
+                language,
+                lastUpdated: order.paymentDetails.lastUpdated,
+                ifFirstPayment: Boolean(order.registerDetails),
+                uid: order.uid,
+                type: "successPayment",
+                viewOrderPage,
+              });
+              console.log("-----sendEmailNotCallable-AFTER-----");
+
+              stripeCustomer = await getOrCreateCustomer(order);
+              console.info('create stripe user on submit payment', stripeCustomer);
+            }
+
+            await updateOrder(doc.id, order)
+              .then(async (status) => {
+                console.log("//////UPDATE_ORDER_WITH_SUCCES_PAYMENT//////");
+                console.log({ status });
+                await createInvoiceNotCallable(doc.id);
+                console.log("-----createInvoiceNotCallable-AFTER-----");
+                return console.log("success");
+              })
+              .catch((error) => {
+                return console.log(error);
+              });
+            console.log("-----updateOrder-AFTER-----");
+          } else {
+
+            console.log('status -> not succeeded');
+
+            await updateOrder(doc.id, order)
+              .then((status) => {
+                console.log(
+                  "//////UPDATE_ORDER_WITH_NOT_SUCCES_PAYMENT//////"
+                );
+                console.log({ status });
+                return console.log("success");
+              })
+              .catch((error) => {
+                return console.log(error);
+              });
+            console.log("-----updateOrder-AFTER-----");
+          }
+
+        })
+        .catch((err) => {
+          return console.log("Error getting documents", err);
+        });
+    }catch(e){
+      console.log(e);
+    }
+  },
+
+  "payment_intent.requires_action": async (event) => {
+
+    const data = event.data.object;
+    
+    console.log("-------------------> payment-intent_requires-action", { data });
+    console.log('---->     Order ID: ', data.metadata.order_id);
+    console.log('----> PayIntent ID: ', data.id); 
+
+    //getOrders(data.id)
+    getOrdersByID(data.metadata.order_id)
+      .then(async (doc) => {
+        if (!doc.exists) {
+          return console.log("ORDER not found.");
+        } else if (doc.exists){
+          console.log('document exists', doc.exists);
+        }
+        // const orders = await snapshot.docs;
+        // for await (const doc of orders) {
+        let order = doc.data();
+
+        order.paymentDetails.status = "progress";
+        order.paymentDetails.method = data.payment_method_types;
+        order.paymentDetails.id = data.id;
+        order.paymentDetails.lastUpdated = new Date(event.created*1000).toISOString();
+
+        console.log({ order });
+
+        await updateOrderNoRegister(doc.id, order.paymentDetails)
+          .then((status) => {
+            console.log(
+              "//////UPDATE_ORDER_WITH_NOT_SUCCES_PAYMENT//////"
+            );
+            console.log({ status });
+            return console.log("updateOrderNoRegister success");
+          })
+          .catch((error) => {
+            return console.log(error);
+          });
+        // }
+      })
+      .catch((e) => {
+        console.log({e});
+        return;
+      })
+  },
+
+  "payment_intent.payment_failed": async (event) => {
+
+    const data = event.data.object;
+
+    console.log("❌ ----------------- PaymentIntent FAILED -----------------",{ data });
+    console.log('💳 ---', data.last_payment_error.payment_method);
+    console.log("", data.error);
+
+    const paymentMethod = data.last_payment_error.payment_method.type;
+
+    getOrdersByID(data.metadata.order_id)
+      .then(async (doc) => {
+        if (!doc.exists) {
+          return console.log("ORDER not found.");
+        } else if (doc.exists){
+          console.log('document exists', doc.exists);
+        }
+        
+        let order = doc.data();
+
+        const status = data.status;
+
+        console.log({status});
+
+        order.paymentDetails.status = "failed";
+        order.paymentDetails.method = paymentMethod;
+        order.paymentDetails.lastUpdated = new Date(event.created*1000).toISOString();
+
+        console.log({ order });
+
+        await updateOrderNoRegister(doc.id, order.paymentDetails)
+          .then((status) => {
+            console.log(
+              "//////UPDATE_ORDER_WITH_NOT_SUCCES_PAYMENT//////"
+            );
+            console.log({ status });
+            return console.log("success");
+          })
+          .catch((error) => {
+            return console.log(error);
+          });
+      })
+      .catch((e) => {
+        console.log({e});
+        return;
+      });
+  },
+
+
+  // CUSTOMER
+  "customer.created": async (event) => {
+    const data= event.data.object;
+    console.log('-------------------> start webhook customer created', {data});
+  },
+
+  "customer.deleted": async (event) => {
+    const data= event.data.object;
+    console.log('-------------------> start webhook customer deleted', {data});
+  },
+
+  "customer.updated": (event) => {
+    const data = event.data.object;
+    console.log("-------------------> customer-suceeded", { data });
+  },
+
+
+  // CHARGE
+  "charge.succeeded": async (event) => {
+    console.log("-------------------> charge-suceeded");
+  },
+
+};
+
+
+/**
+ * Validate the stripe webhook secret, then call the handler for the event type
+ */
+exports.handleStripeWebhook = functions.https.onRequest(async (req, res) => {
+  console.log("------------------------ Handle Stripe Webhook ------------------------------");
+  const sig = req.headers["SIG***"];  
+
+  const isTestMode = await isTestDb();
+  console.log( isTestMode ? 'DIT IS TESTMODUS' : 'GEEN TESTMODUS' );
+
+  const env = isTestMode ? 
+    envConfig.***_SECRET_KEY
+    : envConfig.***_SECRET_KEY;
+
+  const event = stripe.webhooks.constructEvent(
+    req["rawBody"],
+    sig,
+    env
+  );
+
+  console.log('event type', event.type);
+
+  try {
+    await webhookHandlers[event.type](event);
+    res.send({ received: true });
+  } catch (err) {
+    console.error(err);
+    res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+});
